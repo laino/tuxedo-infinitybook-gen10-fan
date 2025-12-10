@@ -31,7 +31,8 @@ This project provides just fan control with no other baggage, keeping the rest n
 │      │                                                      │
 │      ├──reads temps──▶ /sys/class/hwmon/ (k10temp, amdgpu) │
 │      │                                                      │
-│      └──writes speed─▶ /sys/class/uniwill_fan/fan1_speed   │
+│      ├──writes CPU fan─▶ /sys/class/uniwill_fan/fan1_speed │
+│      └──writes GPU fan─▶ /sys/class/uniwill_fan/fan2_speed │
 │                              │                              │
 └──────────────────────────────│──────────────────────────────┘
                                │ sysfs
@@ -45,17 +46,16 @@ This project provides just fan control with no other baggage, keeping the rest n
 │                                              │              │
 └──────────────────────────────────────────────│──────────────┘
                                                ▼
-                                          Fans 1 & 2
+                                     CPU Fan & GPU Fan
 ```
 
 **The daemon loop:**
 
-1. Read CPU temp from `k10temp`, GPU temp from `amdgpu` (EC fallback if unavailable)
-2. Take maximum of CPU and GPU temps
-3. Calculate target speed using interpolated fan curve
-4. Apply hysteresis (6°C gap prevents oscillation)
-5. Write target speed to sysfs
-6. Sleep 1s (active) or 5s (idle, <50°C at minimum speed)
+1. Read CPU temp from `k10temp`, GPU temp from `amdgpu` (EC fallback for CPU if unavailable)
+2. Calculate target speed for each fan independently using interpolated fan curve
+3. Apply hysteresis (6°C gap prevents oscillation)
+4. Write target speeds to sysfs (CPU fan follows CPU temp, GPU fan follows GPU temp)
+5. Sleep 1s
 
 **Fan curve:**
 
@@ -74,10 +74,9 @@ Fan %
 
 - **Silent fan curve**: Smooth, quiet operation with hysteresis
 - **Direct EC control**: Communicates with EC via WMI interface
-- **Dual fan support**: Controls both CPU and GPU fans
+- **Independent dual fan control**: CPU fan follows CPU temp, GPU fan follows GPU temp
 - **Real hwmon integration**: Reads temps from k10temp and amdgpu sensors
 - **EC fallback**: Uses EC temperature sensor if hwmon unavailable
-- **Adaptive polling**: 5s intervals when idle, 1s when active
 - **Systemd service**: Runs automatically on boot
 - **No runtime dependencies**: Single binary, only links to libc
 
@@ -305,10 +304,9 @@ This is intentional. The daemon keeps the fan at a minimum of 12.5% to prevent t
 
 | Path | Access | Description |
 |------|--------|-------------|
-| `/sys/class/uniwill_fan/uniwill_fan/fan1_speed` | RW | Fan 1 speed (0-200) |
-| `/sys/class/uniwill_fan/uniwill_fan/fan2_speed` | RW | Fan 2 speed (0-200) |
-| `/sys/class/uniwill_fan/uniwill_fan/temp1` | RO | EC temperature sensor 1 |
-| `/sys/class/uniwill_fan/uniwill_fan/temp2` | RO | EC temperature sensor 2 |
+| `/sys/class/uniwill_fan/uniwill_fan/fan1_speed` | RW | CPU fan speed (0-200) |
+| `/sys/class/uniwill_fan/uniwill_fan/fan2_speed` | RW | GPU fan speed (0-200) |
+| `/sys/class/uniwill_fan/uniwill_fan/temp1` | RO | EC CPU temperature sensor |
 | `/sys/class/uniwill_fan/uniwill_fan/fan_auto` | WO | Write 1 to restore auto mode |
 
 ### EC Registers
@@ -332,7 +330,7 @@ The fan speed range is 0-200 (where 200 = 100%):
 | 1-24 | Clamped to 25 (minimum running speed) |
 | 25-200 | Direct PWM control |
 
-**Note:** The EC ramps fan speed smoothly, so changes aren't instant. When the daemon shows "Actual" different from "Target", the EC is still transitioning.
+**Note:** The EC ramps fan speed smoothly, so changes aren't instant.
 
 ## License
 

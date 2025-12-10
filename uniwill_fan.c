@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0+
 /*
- * Minimal Uniwill fan control module v2
- * For newer TUXEDO/Uniwill laptops with universal EC fan control
+ * Uniwill Fan Control
+ * Fan control for TUXEDO InfinityBook Pro AMD Gen10
  */
 
 #define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
@@ -20,8 +20,8 @@
 #include <linux/acpi.h>
 #include <linux/mutex.h>
 
-MODULE_DESCRIPTION("Minimal fan control for Uniwill/TUXEDO laptops");
-MODULE_AUTHOR("Community");
+MODULE_DESCRIPTION("Fan control for TUXEDO InfinityBook Pro AMD Gen10");
+MODULE_AUTHOR("Timo Hubois");
 MODULE_VERSION("0.1.0");
 MODULE_LICENSE("GPL");
 
@@ -46,9 +46,8 @@ MODULE_ALIAS("wmi:" UNIWILL_WMI_MGMT_GUID_BC);
 #define UW_EC_REG_FAN1_SPEED   0x1804
 #define UW_EC_REG_FAN2_SPEED   0x1809
 
-/* Temperature sensors */
-#define UW_EC_REG_FAN1_TEMP    0x043e
-#define UW_EC_REG_FAN2_TEMP    0x044f
+/* Temperature sensor */
+#define UW_EC_REG_FAN1_TEMP    0x043e  /* CPU temp */
 
 /* Fan mode register */
 #define UW_EC_REG_FAN_MODE     0x0751
@@ -223,12 +222,11 @@ static int init_custom_fan_table(void)
     return 0;
 }
 
-static int fan_get_temp(int fan_idx)
+static int fan_get_temp(void)
 {
     u8 temp;
-    u16 addr = (fan_idx == 0) ? UW_EC_REG_FAN1_TEMP : UW_EC_REG_FAN2_TEMP;
     
-    if (uw_ec_read(addr, &temp) < 0)
+    if (uw_ec_read(UW_EC_REG_FAN1_TEMP, &temp) < 0)
         return -EIO;
     
     return temp;
@@ -383,21 +381,12 @@ static DEVICE_ATTR_RW(fan2_speed);
 
 static ssize_t temp1_show(struct device *dev, struct device_attribute *attr, char *buf)
 {
-    int temp = fan_get_temp(0);
+    int temp = fan_get_temp();
     if (temp < 0)
         return temp;
     return sprintf(buf, "%d\n", temp);
 }
 static DEVICE_ATTR_RO(temp1);
-
-static ssize_t temp2_show(struct device *dev, struct device_attribute *attr, char *buf)
-{
-    int temp = fan_get_temp(1);
-    if (temp < 0)
-        return temp;
-    return sprintf(buf, "%d\n", temp);
-}
-static DEVICE_ATTR_RO(temp2);
 
 static ssize_t fan_auto_store(struct device *dev, struct device_attribute *attr,
                               const char *buf, size_t count)
@@ -415,7 +404,6 @@ static struct attribute *fan_attrs[] = {
     &dev_attr_fan1_speed.attr,
     &dev_attr_fan2_speed.attr,
     &dev_attr_temp1.attr,
-    &dev_attr_temp2.attr,
     &dev_attr_fan_auto.attr,
     NULL,
 };

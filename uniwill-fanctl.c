@@ -49,15 +49,19 @@
 #define SPEED_MAX       200     /* 100% */
 
 /* Timing */
-#define INTERVAL_ACTIVE 1       /* Seconds between updates when active */
-#define INTERVAL_IDLE   5       /* Seconds between updates when idle */
-#define TEMP_IDLE       50      /* Below this temp, use idle interval */
-#define MIN_ON_TIME     15      /* Minimum seconds fan stays on */
+#define POLL_INTERVAL   1       /* Seconds between updates */
+
+/* Per-fan state for independent control */
+struct fan_state {
+    int current;        /* Current speed */
+    int prev_target;    /* Previous target for trend */
+};
 
 /* State */
 static volatile sig_atomic_t running = 1;
 static int interactive = 0;
-static time_t fan_on_since = 0;
+static struct fan_state cpu_fan = {0, -1};
+static struct fan_state gpu_fan = {0, -1};
 static char hwmon_cpu[384] = {0};
 static char hwmon_gpu[384] = {0};
 
@@ -164,20 +168,33 @@ static int get_hwmon_temp(const char *hwmon_path)
     return temp / 1000;
 }
 
-/* Get current temperature (max of CPU and GPU) */
-static int get_temp(int *cpu_temp, int *gpu_temp)
+/* Get current temperatures with fallback logic */
+static void get_temp(int *cpu_temp, int *gpu_temp)
 {
-    *cpu_temp = get_hwmon_temp(hwmon_cpu);
-    *gpu_temp = get_hwmon_temp(hwmon_gpu);
+    int cpu_hwmon, gpu_hwmon, ec_temp;
 
-    /* Fallback to EC sensor if no hwmon CPU sensor */
-    if (*cpu_temp <= 0) {
-        *cpu_temp = sysfs_read_int(SYSFS_TEMP1);
-        if (*cpu_temp <= 0)
-            *cpu_temp = 50;  /* Last resort fallback */
-    }
+    /* Read from hwmon sensors */
+    cpu_hwmon = get_hwmon_temp(hwmon_cpu);
+    gpu_hwmon = get_hwmon_temp(hwmon_gpu);
 
-    return (*cpu_temp > *gpu_temp) ? *cpu_temp : *gpu_temp;
+    /* Read EC temp as fallback */
+    ec_temp = sysfs_read_int(SYSFS_TEMP1);
+    if (ec_temp <= 0)
+        ec_temp = 0;
+
+    /* CPU temp: k10temp -> EC -> GPU temp (APU shares die) */
+    if (cpu_hwmon > 0)
+        *cpu_temp = cpu_hwmon;
+    else if (ec_temp > 0)
+        *cpu_temp = ec_temp;
+    else
+        *cpu_temp = gpu_hwmon;  /* APU fallback */
+
+    /* GPU temp: amdgpu -> CPU temp (APU shares die) */
+    if (gpu_hwmon > 0)
+        *gpu_temp = gpu_hwmon;
+    else
+        *gpu_temp = *cpu_temp;  /* APU fallback - use CPU temp */
 }
 
 /* Linear interpolation for smooth fan curve */
@@ -208,28 +225,19 @@ static int interpolate_speed(int temp)
     }
 }
 
-/* Calculate target speed with hysteresis */
-static int calc_target(int temp, int current)
+/* Calculate target speed with hysteresis for a specific fan */
+static int calc_target(int temp, struct fan_state *fan)
 {
     int target;
-    time_t now;
 
     target = interpolate_speed(temp);
 
     /* Apply hysteresis - only step down if significantly cooler */
-    if (target < current) {
+    if (target < fan->current) {
         int cooler_target = interpolate_speed(temp + HYSTERESIS);
-        if (cooler_target >= current) {
+        if (cooler_target >= fan->current) {
             /* Not cool enough to step down yet */
-            target = current;
-        }
-    }
-
-    /* Minimum on-time - don't turn off too quickly */
-    if (target == 0 && current > 0) {
-        now = time(NULL);
-        if (now - fan_on_since < MIN_ON_TIME) {
-            target = SPEED_LOW;
+            target = fan->current;
         }
     }
 
@@ -259,23 +267,30 @@ static void print_banner(void)
     printf("\n");
     printf("  CPU sensor: %s\n", hwmon_cpu[0] ? hwmon_cpu : "EC fallback");
     printf("  GPU sensor: %s\n", hwmon_gpu[0] ? hwmon_gpu : "none");
+    printf("  Mode: Independent (CPU fan follows CPU temp, GPU fan follows GPU temp)\n");
     printf("\n");
+    printf("  Trend: ^ = ramping up, v = slowing down, = = steady\n");
     printf("  Ctrl+C to stop and restore automatic control\n");
     printf("\n");
-    printf("Time     | CPU | GPU | Max | Tgt | Act | Status\n");
-    printf("---------|-----|-----|-----|-----|-----|--------\n");
+    printf("Time     |     | Tmp | Fan\n");
+    printf("---------|-----|-----|-------\n");
 }
 
-static const char *get_status(int actual, int target)
+static const char *get_trend(int target, int *prev_target)
 {
-    if (actual <= 1)
-        return "Silent";
-    else if (actual < target)
-        return "Ramping";
-    else if (actual > target)
-        return "Cooling";
+    const char *trend;
+
+    if (*prev_target < 0)
+        trend = " ";        /* First reading */
+    else if (target > *prev_target)
+        trend = "^";        /* Ramping up */
+    else if (target < *prev_target)
+        trend = "v";        /* Slowing down */
     else
-        return "Steady";
+        trend = "=";        /* Steady */
+
+    *prev_target = target;
+    return trend;
 }
 
 static void usage(const char *prog)
@@ -300,8 +315,9 @@ static void usage(const char *prog)
 
 int main(int argc, char *argv[])
 {
-    int temp, cpu_temp, gpu_temp;
-    int actual, target;
+    int cpu_temp, gpu_temp;
+    int cpu_target, gpu_target;
+    int cpu_actual, gpu_actual;
     time_t now;
     struct tm *tm_info;
     struct timespec ts;
@@ -336,35 +352,40 @@ int main(int argc, char *argv[])
     signal(SIGINT, signal_handler);
     signal(SIGTERM, signal_handler);
 
-    if (interactive)
+    if (interactive) {
         print_banner();
-    else
+        /* Print initial blank lines for cursor-up to work */
+        printf("\n\n");
+    } else {
         printf("Starting fan control daemon...\n");
+    }
 
     /* Take over fan control */
     sysfs_write_int(SYSFS_FAN_AUTO, 0);
 
     /* Main loop */
     while (running) {
-        temp = get_temp(&cpu_temp, &gpu_temp);
-        actual = sysfs_read_int(SYSFS_FAN1);
-        if (actual < 0)
-            actual = 0;
+        get_temp(&cpu_temp, &gpu_temp);
 
-        target = calc_target(temp, actual);
+        /* Read current fan speeds */
+        cpu_actual = sysfs_read_int(SYSFS_FAN1);
+        if (cpu_actual < 0)
+            cpu_actual = 0;
+        gpu_actual = sysfs_read_int(SYSFS_FAN2);
+        if (gpu_actual < 0)
+            gpu_actual = 0;
 
-        /* Track when fan turns on */
-        if (actual <= 1 && target > 0)
-            fan_on_since = time(NULL);
+        /* Update fan state with current readings */
+        cpu_fan.current = cpu_actual;
+        gpu_fan.current = gpu_actual;
 
-        /* Write to fans */
-        sysfs_write_int(SYSFS_FAN1, target);
-        sysfs_write_int(SYSFS_FAN2, target);
+        /* Calculate independent targets */
+        cpu_target = calc_target(cpu_temp, &cpu_fan);
+        gpu_target = calc_target(gpu_temp, &gpu_fan);
 
-        /* Read back actual speed */
-        actual = sysfs_read_int(SYSFS_FAN1);
-        if (actual < 0)
-            actual = 0;
+        /* Write to fans independently */
+        sysfs_write_int(SYSFS_FAN1, cpu_target);
+        sysfs_write_int(SYSFS_FAN2, gpu_target);
 
         /* Display */
         if (interactive) {
@@ -372,20 +393,23 @@ int main(int argc, char *argv[])
             tm_info = localtime(&now);
             strftime(time_buf, sizeof(time_buf), "%H:%M:%S", tm_info);
 
-            printf("\r%s | %3d | %3d | %3d | %3d | %3d | %-8s",
+            /* Move cursor up 2 lines and overwrite */
+            printf("\033[2A");
+            printf("%s | CPU | %3d | %3d%% %s\n",
                    time_buf,
                    cpu_temp,
+                   cpu_target * 100 / 200,
+                   get_trend(cpu_target, &cpu_fan.prev_target));
+            printf("         | GPU | %3d | %3d%% %s\n",
                    gpu_temp,
-                   temp,
-                   target * 100 / 200,
-                   actual * 100 / 200,
-                   get_status(actual, target));
+                   gpu_target * 100 / 200,
+                   get_trend(gpu_target, &gpu_fan.prev_target));
             fflush(stdout);
         }
 
-        /* Adaptive sleep - poll less when idle */
+        /* Sleep until next update */
         ts.tv_nsec = 0;
-        ts.tv_sec = (temp < TEMP_IDLE && actual <= 1) ? INTERVAL_IDLE : INTERVAL_ACTIVE;
+        ts.tv_sec = POLL_INTERVAL;
         nanosleep(&ts, NULL);
     }
 
