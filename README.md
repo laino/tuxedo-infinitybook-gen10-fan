@@ -6,7 +6,7 @@ Minimal, silent fan control for TUXEDO InfinityBook Pro Gen10.
 
 ## Why?
 
-The stock kernel has no fan control for Uniwill-based laptops. TUXEDO provides their Control Center and custom kernel modules, but Control Center is a heavy Electron app and the tuxedo-drivers caused issues on my system - including the CPU randomly getting stuck at 600MHz. 
+The stock kernel has no fan control for Uniwill-based laptops. TUXEDO provides their Control Center and custom kernel modules, but Control Center is a heavy Electron app and the tuxedo-drivers caused issues on my system - including the CPU randomly getting stuck at 600MHz.
 
 This project provides just fan control with no other baggage, keeping the rest native:
 
@@ -27,10 +27,10 @@ This project provides just fan control with no other baggage, keeping the rest n
 ┌─────────────────────────────────────────────────────────────┐
 │                      User Space                             │
 │                                                             │
-│  ibg10-fanctl (daemon)                                      │
-│      │                                                      │
-│      ├──reads temps──▶ /sys/class/hwmon/ (k10temp, amdgpu) │
-│      │                                                      │
+│  ibg10-fanctl (daemon)                                             │
+│      │                                                                       │
+│      ├──reads temps──▶ /sys/class/hwmon/ (k10temp, amdgpu)                   │
+│      │                                                                       │
 │      ├──writes CPU fan─▶ /sys/class/tuxedo_infinitybook_gen10_fan/fan1_speed │
 │      └──writes GPU fan─▶ /sys/class/tuxedo_infinitybook_gen10_fan/fan2_speed │
 │                              │                              │
@@ -54,7 +54,7 @@ This project provides just fan control with no other baggage, keeping the rest n
 1. Read CPU temp from `k10temp`, GPU temp from `amdgpu` (EC fallback for CPU if unavailable)
 2. Calculate target speed for each fan independently using interpolated fan curve
 3. Apply hysteresis (6°C gap prevents oscillation)
-4. Write target speeds to sysfs (CPU fan follows CPU temp, GPU fan follows GPU temp)
+4. Write target speed to both fans (unified control - both follow max temp due to shared heatpipes)
 5. Sleep 1s
 
 **Fan curve:**
@@ -74,7 +74,7 @@ Fan %
 
 - **Silent fan curve**: Smooth, quiet operation with hysteresis
 - **Direct EC control**: Communicates with EC via WMI interface
-- **Independent dual fan control**: CPU fan follows CPU temp, GPU fan follows GPU temp
+- **Unified dual fan control**: Both fans follow max temperature (shared heatpipes)
 - **Real hwmon integration**: Reads temps from k10temp and amdgpu sensors
 - **EC fallback**: Uses EC temperature sensor if hwmon unavailable
 - **Systemd service**: Runs automatically on boot
