@@ -21,24 +21,42 @@ This project provides just fan control with no other baggage, keeping the rest n
 - `power-profiles-daemon` for power management
 - This project for fan control
 
+## Linux 6.19+ and Upstream Driver Status
+
+**Current State (as of December 2025):**
+
+- Linux 6.19 (currently in RC phase) includes the in-tree `uniwill-laptop` driver
+- Upstream driver provides **read-only** monitoring: temperatures, fan RPM, PWM values via hwmon
+- Upstream driver does **NOT** provide manual fan control or custom fan curves
+- Future plans for upstream driver are unknown - manual control *may* be added later
+
+**This Module's Role:**
+
+- **Linux 6.19+**: Use alongside upstream `uniwill-laptop` driver
+  - Read temps from upstream `uniwill` hwmon or other sources (k10temp, amdgpu)
+  - Write manual PWM control via this module's separate hwmon device (`uniwill_ibg10_fanctl`)
+  - Provides custom fan curves that upstream lacks
+
+- **Linux <6.19**: Works standalone with full hwmon interface (read temps + write PWM)
+
+**Note for Future:** Check upstream `uniwill-laptop` driver capabilities if manual fan control gets added. This module may still provide value through custom curve implementation.
+
 ## How It Works
 
 ```
 ┌──────────────────────────────────────────────────────────────────────────────┐
 │  User Space                                                                  │
 │                                                                              │
-│  ibg10-fanctl (daemon)                                                       │
+│  uniwill_ibg10_fanctl (daemon)                                               │
 │      │                                                                       │
-│      ├──reads temps──▶ /sys/class/hwmon/ (k10temp, amdgpu)                   │
-│      │                                                                       │
-│      ├──writes CPU fan─▶ /sys/class/tuxedo_infinitybook_gen10_fan/fan1_speed │
-│      └──writes GPU fan─▶ /sys/class/tuxedo_infinitybook_gen10_fan/fan2_speed │
-│                              │                                               │
-└──────────────────────────────│───────────────────────────────────────────────┘
-                               │ sysfs
+│      ├──reads temps──▶ /sys/class/hwmon/ (uniwill→k10temp→EC, amdgpu→EC)     │
+│      └──writes PWM──▶ /sys/class/hwmon/.../pwm1 (uniwill_ibg10_fanctl device)│
+│                                                                              │
+└──────────────────────────────────────────────────────────────────────────────┘
+                               │ sysfs hwmon
 ┌──────────────────────────────│───────────────────────────────────────────────┐
 │  Kernel                      ▼                                               │
-│                    tuxedo_infinitybook_gen10_fan.ko                          │
+│                    uniwill_ibg10_fanctl.ko                                   │
 │                         │                                                    │
 │                         │ WMI calls                                          │
 │                         ▼                                                    │
@@ -51,7 +69,7 @@ This project provides just fan control with no other baggage, keeping the rest n
 
 **The daemon loop:**
 
-1. Read CPU temp from `k10temp`, GPU temp from `amdgpu` (EC fallback for CPU if unavailable)
+1. Read CPU temp (priority: `uniwill` → `k10temp`), GPU temp from `amdgpu`. If both fail, use `uniwill` EC temp
 2. Calculate target speed for each fan independently using interpolated fan curve
 3. Apply hysteresis (6°C gap prevents oscillation)
 4. Write target speed to both fans (unified control - both follow max temp due to shared heatpipes)
@@ -88,6 +106,8 @@ Fan %
 - Arch Linux, kernel 6.x
 - WMI GUID `ABBC0F6F-8EA1-11D1-00A0-C90629100000`
 
+See the "Linux 6.19+ and Upstream Driver Status" section above for kernel compatibility details.
+
 ## Installation
 
 ### Prerequisites
@@ -102,20 +122,21 @@ sudo pacman -S base-devel linux-headers dkms
 git clone https://github.com/timohubois/tuxedo-infinitybook-gen10-fan.git
 cd tuxedo-infinitybook-gen10-fan
 
-# Build
+# Build module + daemon
 make
 
 # Load module for testing
 sudo make load
 
-# Verify it works
-cat /sys/class/tuxedo_infinitybook_gen10_fan/tuxedo_infinitybook_gen10_fan/temp1      # EC temp (degrees C)
-cat /sys/class/tuxedo_infinitybook_gen10_fan/tuxedo_infinitybook_gen10_fan/fan1_speed # Fan speed (0-200)
+# Verify hwmon appears (uniwill_ibg10_fanctl)
+ls /sys/class/hwmon/*/name
 
-# Test manual control
-echo 100 | sudo tee /sys/class/tuxedo_infinitybook_gen10_fan/tuxedo_infinitybook_gen10_fan/fan1_speed  # Set 50%
-echo 50 | sudo tee /sys/class/tuxedo_infinitybook_gen10_fan/tuxedo_infinitybook_gen10_fan/fan1_speed   # Set 25%
-echo 1 | sudo tee /sys/class/tuxedo_infinitybook_gen10_fan/tuxedo_infinitybook_gen10_fan/fan_auto      # Restore auto
+# Read temp (millidegrees)
+cat /sys/class/hwmon/*/temp1_input
+
+# Test manual control (0-255 hwmon scale)
+echo 128 | sudo tee /sys/class/hwmon/*/pwm1  # ~50%
+echo 2   | sudo tee /sys/class/hwmon/*/pwm1_enable  # Restore auto
 ```
 
 If this works, proceed to step 2.
@@ -124,10 +145,10 @@ If this works, proceed to step 2.
 
 ```bash
 # Run daemon manually (Ctrl+C to stop)
-sudo ./ibg10-fanctl
+sudo ./daemon/uniwill_ibg10_fanctl
 ```
 
-You should see temperature and fan speed updating. Run `./ibg10-fanctl -h` for help. If this works, proceed to step 3.
+You should see temperature and fan speed updating. Run `./daemon/uniwill_ibg10_fanctl -h` for help. If this works, proceed to step 3.
 
 ### Step 3: Install Permanently
 
@@ -136,9 +157,10 @@ You should see temperature and fan speed updating. Run `./ibg10-fanctl -h` for h
 DKMS automatically rebuilds the module when you update your kernel:
 
 ```bash
-sudo make tuxedo-infinitybook-gen10-fan-install-dkms
-sudo systemctl enable --now tuxedo-infinitybook-gen10-fan.service
+sudo make uniwill-ibg10-fanctl-install-dkms
 ```
+
+This installs and starts everything automatically.
 
 #### Option B: Manual Installation
 
@@ -146,8 +168,9 @@ Without DKMS, you'll need to rebuild manually after kernel updates:
 
 ```bash
 sudo make install-all
-sudo systemctl enable --now tuxedo-infinitybook-gen10-fan.service
 ```
+
+This installs and starts everything automatically.
 
 ### Manual Installation (Step-by-Step)
 
@@ -155,52 +178,64 @@ If you prefer step-by-step:
 
 ```bash
 # Install module via DKMS (or use 'make install' for non-DKMS)
-sudo make tuxedo-infinitybook-gen10-fan-dkms-install
+sudo make uniwill-ibg10-fanctl-install-dkms
 
 # Auto-load on boot
 sudo make install-autoload
 
-# Install and enable service
+# Install, enable, and start service (daemon built in ./daemon)
 sudo make install-service
-sudo systemctl enable --now tuxedo-infinitybook-gen10-fan.service
 ```
 
 ## Usage
 
 ### Manual Control
 
+**Note:** Stop the daemon first if it's running: `sudo systemctl stop uniwill-ibg10-fanctl.service`
+
 ```bash
 # Load module
-sudo modprobe tuxedo_infinitybook_gen10_fan
+sudo modprobe uniwill_ibg10_fanctl
+
+# Find the hwmon device (the number varies, e.g., hwmon11)
+HWMON_DEV=$(grep -l uniwill_ibg10_fanctl /sys/class/hwmon/*/name | sed 's|/name||')
 
 # Check current values
-cat /sys/class/tuxedo_infinitybook_gen10_fan/tuxedo_infinitybook_gen10_fan/temp1      # EC temp (degrees C)
-cat /sys/class/tuxedo_infinitybook_gen10_fan/tuxedo_infinitybook_gen10_fan/fan1_speed # Fan speed (0-200)
+cat $HWMON_DEV/temp1_input  # EC temp (millidegrees C, divide by 1000)
+cat $HWMON_DEV/pwm1         # Fan1 PWM (0-255 scale)
+cat $HWMON_DEV/pwm2         # Fan2 PWM (0-255 scale)
+cat $HWMON_DEV/pwm1_enable  # 1=manual, 2=auto
 
-# Set fan speed (0-200, where 200 = 100%)
-echo 100 | sudo tee /sys/class/tuxedo_infinitybook_gen10_fan/tuxedo_infinitybook_gen10_fan/fan1_speed
+# Set manual mode and control fan speed (0-255 hwmon scale)
+echo 1 | sudo tee $HWMON_DEV/pwm1_enable   # Switch to manual mode
+echo 128 | sudo tee $HWMON_DEV/pwm1        # Set fan1 to ~50%
+echo 128 | sudo tee $HWMON_DEV/pwm2        # Set fan2 to ~50%
 
-# Restore automatic control
-echo 1 | sudo tee /sys/class/tuxedo_infinitybook_gen10_fan/tuxedo_infinitybook_gen10_fan/fan_auto
+# Restore automatic mode (EC control)
+echo 2 | sudo tee $HWMON_DEV/pwm1_enable
+echo 2 | sudo tee $HWMON_DEV/pwm2_enable
+
+# Restart daemon when done
+sudo systemctl start uniwill-ibg10-fanctl.service
 ```
 
 ### Fan Curve Daemon
 
 ```bash
 # Run manually (interactive mode with status display)
-sudo ./ibg10-fanctl
+sudo ./daemon/uniwill_ibg10_fanctl
 
 # Show help and configuration
-./ibg10-fanctl -h
+./daemon/uniwill_ibg10_fanctl -h
 
 # Or use the systemd service
-sudo systemctl start tuxedo-infinitybook-gen10-fan.service
-sudo systemctl status tuxedo-infinitybook-gen10-fan.service
+sudo systemctl start uniwill-ibg10-fanctl.service
+sudo systemctl status uniwill-ibg10-fanctl.service
 ```
 
 ### Configuration
 
-The fan curve thresholds are compiled into the binary. To customize, edit `ibg10-fanctl.c` and rebuild:
+The fan curve thresholds are compiled into the binary. To customize, edit `daemon/uniwill_ibg10_fanctl.c` and rebuild:
 
 ```c
 /* Temperature thresholds (C) */
@@ -223,7 +258,7 @@ The fan curve thresholds are compiled into the binary. To customize, edit `ibg10
 Then rebuild and reinstall:
 
 ```bash
-make ibg10-fanctl
+make daemon
 sudo make install-service
 ```
 
@@ -232,7 +267,7 @@ sudo make install-service
 ### DKMS
 
 ```bash
-sudo make tuxedo-infinitybook-gen10-fan-uninstall-dkms
+sudo make uniwill-ibg10-fanctl-uninstall-dkms
 ```
 
 ### Non-DKMS
@@ -244,7 +279,7 @@ sudo make uninstall-all
 Or manually:
 
 ```bash
-sudo systemctl disable --now tuxedo-infinitybook-gen10-fan.service
+sudo systemctl disable --now uniwill-ibg10-fanctl.service
 sudo make uninstall-service
 sudo make uninstall-autoload
 sudo make uninstall
@@ -263,16 +298,20 @@ ls /sys/bus/wmi/devices/ | grep ABBC0F6
 Check kernel logs:
 
 ```bash
-dmesg | grep tuxedo_infinitybook
+dmesg | grep uniwill_ibg10_fanctl
 ```
 
 ### Fans not responding
 
-Verify the sysfs interface exists:
+Verify the hwmon interface exists:
 
 ```bash
-ls /sys/class/tuxedo_infinitybook_gen10_fan/tuxedo_infinitybook_gen10_fan/
-cat /sys/class/tuxedo_infinitybook_gen10_fan/tuxedo_infinitybook_gen10_fan/fan1_speed
+# Find the hwmon device for this module
+ls /sys/class/hwmon/*/name | xargs grep -l uniwill_ibg10_fanctl
+
+# Read current PWM value
+HWMON_DEV=$(grep -l uniwill_ibg10_fanctl /sys/class/hwmon/*/name | sed 's|/name||')
+cat $HWMON_DEV/pwm1
 ```
 
 ### Service not starting
@@ -280,14 +319,14 @@ cat /sys/class/tuxedo_infinitybook_gen10_fan/tuxedo_infinitybook_gen10_fan/fan1_
 Check if module is loaded:
 
 ```bash
-lsmod | grep tuxedo_infinitybook_gen10_fan
+lsmod | grep uniwill_ibg10_fanctl
 ```
 
 Check service status:
 
 ```bash
-sudo systemctl status tuxedo-infinitybook-gen10-fan.service
-sudo journalctl -u tuxedo-infinitybook-gen10-fan.service
+sudo systemctl status uniwill-ibg10-fanctl.service
+sudo journalctl -u uniwill-ibg10-fanctl.service
 ```
 
 ### Fan never fully stops
@@ -296,14 +335,16 @@ This is intentional. The daemon keeps the fan at a minimum of 12.5% to prevent t
 
 ## Technical Details
 
-### Sysfs Interface
+### Hwmon Interface (0-255 PWM)
 
-| Path | Access | Description |
+| Path (example) | Access | Description |
 |------|--------|-------------|
-| `/sys/class/tuxedo_infinitybook_gen10_fan/tuxedo_infinitybook_gen10_fan/fan1_speed` | RW | CPU fan speed (0-200) |
-| `/sys/class/tuxedo_infinitybook_gen10_fan/tuxedo_infinitybook_gen10_fan/fan2_speed` | RW | GPU fan speed (0-200) |
-| `/sys/class/tuxedo_infinitybook_gen10_fan/tuxedo_infinitybook_gen10_fan/temp1` | RO | EC CPU temperature sensor |
-| `/sys/class/tuxedo_infinitybook_gen10_fan/tuxedo_infinitybook_gen10_fan/fan_auto` | WO | Write 1 to restore auto mode |
+| `/sys/class/hwmon/hwmonX/name` | RO | Should read `uniwill_ibg10_fanctl` |
+| `/sys/class/hwmon/hwmonX/temp1_input` | RO | EC CPU temperature (millidegrees) |
+| `/sys/class/hwmon/hwmonX/pwm1` | RW | Fan1 PWM (0-255) |
+| `/sys/class/hwmon/hwmonX/pwm2` | RW | Fan2 PWM (0-255) |
+| `/sys/class/hwmon/hwmonX/pwm1_enable` | RW | 1=manual, 2=auto |
+| `/sys/class/hwmon/hwmonX/pwm2_enable` | RW | 1=manual, 2=auto |
 
 ### EC Registers
 
@@ -318,13 +359,13 @@ The module uses the Uniwill WMI interface to communicate with the EC:
 
 ### Fan Speed Values
 
-The fan speed range is 0-200 (where 200 = 100%):
+The hwmon-visible fan speed range is 0-255 (mapped to EC 0-200 internally):
 
 | Value | Behavior |
 |-------|----------|
-| 0 | Fan off (internally set to 1 to prevent EC override) |
-| 1-24 | Clamped to 25 (minimum running speed) |
-| 25-200 | Direct PWM control |
+| 0 | Fan off (internally clamped to safe minimum) |
+| 1-31 | Clamped to ~12.5% (minimum running speed) |
+| 32-255 | Direct PWM control (mapped to EC scale) |
 
 ## License
 
