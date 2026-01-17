@@ -24,6 +24,7 @@
 #define HWMON_BASE "/sys/class/hwmon"
 
 /* Temperature thresholds (C) */
+#define TEMP_OFF        55
 #define TEMP_SILENT     62
 #define TEMP_LOW        70
 #define TEMP_MED        78
@@ -34,7 +35,8 @@
 #define HYSTERESIS      6
 
 /* Fan speeds (0-255 hwmon scale). EC uses 0-200; we convert. */
-#define SPEED_MIN       32   /* ~12.5% of 255 rounded */
+#define SPEED_OFF       0
+#define SPEED_MIN       39   /* ~15% of 255 rounded */
 #define SPEED_LOW       64   /* 25% */
 #define SPEED_MED       128  /* 50% */
 #define SPEED_HIGH      192  /* 75% */
@@ -222,7 +224,9 @@ static int interpolate_speed(int temp)
 {
     int range, pos;
 
-    if (temp <= TEMP_SILENT) {
+    if (temp <= TEMP_OFF) {
+        return SPEED_OFF;
+    } else if (temp <= TEMP_SILENT) {
         return SPEED_MIN;
     } else if (temp <= TEMP_LOW) {
         range = TEMP_LOW - TEMP_SILENT;
@@ -245,14 +249,14 @@ static int interpolate_speed(int temp)
     }
 }
 
-static int calc_target(int temp, struct fan_state *fan)
+static int calc_target(int temp, int previous_target)
 {
     int target = interpolate_speed(temp);
 
-    if (target < fan->current) {
+    if (target < previous_target) {
         int cooler_target = interpolate_speed(temp + HYSTERESIS);
-        if (cooler_target >= fan->current)
-            target = fan->current;
+        if (cooler_target >= previous_target)
+            target = previous_target;
     }
 
     return target;
@@ -336,7 +340,8 @@ static void print_banner(void)
     printf("\n");
     printf("  TUXEDO InfinityBook Gen10 Silent Fan Control (hwmon)\n");
     printf("  ----------------------------------------------------\n");
-    printf("  Fan off:    < %d C\n", TEMP_SILENT);
+    printf("  Fan off:    < %d C\n", TEMP_OFF);
+    printf("  Fan silent: %d-%d C\n", TEMP_OFF, TEMP_SILENT);
     printf("  Low speed:  %d-%d C\n", TEMP_SILENT, TEMP_LOW);
     printf("  Med speed:  %d-%d C\n", TEMP_LOW, TEMP_MED);
     printf("  High speed: %d-%d C\n", TEMP_MED, TEMP_HIGH);
@@ -378,9 +383,9 @@ static void restore_auto(void)
 int main(int argc, char *argv[])
 {
     int temp;
-    int target;
-    int fan_actual1, fan_actual2;
-    int fan_actual_avg;
+    int target = 0;
+    //int fan_actual1, fan_actual2;
+    //int fan_actual_avg;
     time_t now;
     struct tm *tm_info;
     struct timespec ts;
@@ -438,6 +443,7 @@ int main(int argc, char *argv[])
         else
             temp = (cpu_t > gpu_t) ? cpu_t : gpu_t;
 
+	/*
         fan_actual1 = sysfs_read_int(pwm_sink.pwm1);
         if (fan_actual1 < 0)
             fan_actual1 = 0;
@@ -447,7 +453,8 @@ int main(int argc, char *argv[])
 
         fan_actual_avg = (fan_actual1 + fan_actual2) / 2;
         unified_fan.current = fan_actual_avg;
-        target = calc_target(temp, &unified_fan);
+	*/
+        target = calc_target(temp, target);
 
         sysfs_write_int(pwm_sink.pwm1, target);
         if (pwm_sink.has_pwm2)
