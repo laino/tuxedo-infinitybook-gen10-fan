@@ -25,11 +25,11 @@
 
 /* Temperature thresholds (C) */
 #define TEMP_OFF        55
-#define TEMP_SILENT     62
-#define TEMP_LOW        70
-#define TEMP_MED        78
-#define TEMP_HIGH       86
-#define TEMP_MAX        92
+#define TEMP_SILENT     61
+#define TEMP_LOW        67
+#define TEMP_MED        73
+#define TEMP_HIGH       80
+#define TEMP_MAX        90
 
 /* Hysteresis - how much cooler before stepping down */
 #define HYSTERESIS      6
@@ -37,17 +37,26 @@
 /* Fan speeds (0-255 hwmon scale). EC uses 0-200; we convert. */
 #define SPEED_OFF       0
 #define SPEED_MIN       39   /* ~15% of 255 rounded */
-#define SPEED_LOW       64   /* 25% */
-#define SPEED_MED       128  /* 50% */
-#define SPEED_HIGH      192  /* 75% */
+#define SPEED_LOW       96
+#define SPEED_MED       128
+#define SPEED_HIGH      192
 #define SPEED_MAX       255  /* 100% */
 
 /* Timing */
 #define POLL_INTERVAL   1       /* Seconds between updates */
 
+/* Temperature smoothing to filter sensor spikes from localized chip heating */
+#define TEMP_HISTORY_SIZE  8    /* Moving average window (samples) */
+
 struct fan_state {
     int current;        /* Current speed (0-255) */
     int prev_target;    /* Previous target for trend */
+};
+
+struct temp_history {
+    int samples[TEMP_HISTORY_SIZE];
+    int index;
+    int count;
 };
 
 struct temp_paths {
@@ -70,6 +79,7 @@ static struct fan_state unified_fan = {0, -1};
 static struct temp_paths cpu_temp_src; /* k10temp or uniwill */
 static struct temp_paths gpu_temp_src; /* amdgpu */
 static struct pwm_paths pwm_sink;      /* writable PWM device (uniwill_ibg10_fanctl) */
+static struct temp_history temp_smooth = {{0}, 0, 0};
 
 static void signal_handler(int sig)
 {
@@ -217,6 +227,24 @@ static int get_temp(const struct temp_paths *src)
     if (temp < 0)
         return -1;
     return temp / 1000;
+}
+
+/* Add temperature sample to history and return moving average */
+static int smooth_temp(struct temp_history *hist, int temp)
+{
+    int i, sum = 0;
+
+    /* Add new sample to circular buffer */
+    hist->samples[hist->index] = temp;
+    hist->index = (hist->index + 1) % TEMP_HISTORY_SIZE;
+    if (hist->count < TEMP_HISTORY_SIZE)
+        hist->count++;
+
+    /* Calculate average of available samples */
+    for (i = 0; i < hist->count; i++)
+        sum += hist->samples[i];
+
+    return sum / hist->count;
 }
 
 /* Linear interpolation for smooth fan curve */
@@ -433,15 +461,19 @@ int main(int argc, char *argv[])
     while (running) {
         int cpu_t = cpu_temp_src.temp[0] ? get_temp(&cpu_temp_src) : -1;
         int gpu_t = gpu_temp_src.temp[0] ? get_temp(&gpu_temp_src) : -1;
+        int raw_temp;
 
         if (cpu_t < 0 && gpu_t < 0)
-            temp = 0;
+            raw_temp = 0;
         else if (cpu_t < 0)
-            temp = gpu_t;
+            raw_temp = gpu_t;
         else if (gpu_t < 0)
-            temp = cpu_t;
+            raw_temp = cpu_t;
         else
-            temp = (cpu_t > gpu_t) ? cpu_t : gpu_t;
+            raw_temp = (cpu_t > gpu_t) ? cpu_t : gpu_t;
+
+        /* Smooth temperature to filter sensor spikes from localized heating */
+        temp = smooth_temp(&temp_smooth, raw_temp);
 
 	/*
         fan_actual1 = sysfs_read_int(pwm_sink.pwm1);
